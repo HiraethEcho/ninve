@@ -396,7 +396,7 @@ fn main() -> Result<()> {
                             generate_filename(&media_path, ninve.trimmed.start, ninve.trimmed.end).with_context(|| format!("running because: {reason:?}"))
                         })
                         .context("evaluating output path")?;
-                    let mut help_text = [
+                    let help_text = [
                         "QUIT:           <c> / <q>",
                         "TRIM LEFT:      <[>",
                         "TRIM RIGHT:     <]>",
@@ -409,10 +409,24 @@ fn main() -> Result<()> {
                         format!("file will be rendered to: {}", output_path.display()).as_str(),
                     ]
                     .join("\n");
-                    if let Some(status) = &ninve.trim_status {
-                        help_text.push('\n');
-                        help_text.push_str(status);
-                    }
+                    let draw = |frame: &mut ratatui::Frame, ninve: &Ninve, help_text: &str, media_path: &Path| -> std::io::Result<()> {
+                        ninve.pipe_ref(
+                            |Ninve { loop_mode, event_log: _, full, trimmed, pos, trim_status: _ }|
+                            -> Result<()> {
+                                let app = frame.area();
+                                let [controls, progress_bar] = Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(app);
+                                let mut display_text = help_text.to_string();
+                                if let Some(status) = &ninve.trim_status { display_text.push('\n'); display_text.push_str(status); }
+                                display_text.pipe(Paragraph::new).block(Block::bordered().title_top(format!("{CRATE_NAME} v{CRATE_VERSION} ({})", media_path.display()))).render(controls, frame.buffer_mut());
+                                let (trim_left, active, trim_right) = full.to_subrange(*trimmed).expect("bad subrange");
+                                let [left, center, right] = Layout::horizontal([full.ratio(trim_left.length()).map(Constraint::from)?, full.ratio(active.length()).map(Constraint::from)?, full.ratio(trim_right.length()).map(Constraint::from)?]).areas(progress_bar);
+                                let gauge = |color: Color| Gauge::default().style(color);
+                                if let Ok(ratio) = trim_left.ratio(*pos).map(f64::from) { gauge(tailwind::GRAY.c700).ratio(ratio).block(Block::bordered()).render(left, frame.buffer_mut()); }
+                                if let Ok(ratio) = active.ratio(*pos).map(f64::from) { gauge(match loop_mode { true => tailwind::GREEN.c100, false => tailwind::GRAY.c100 }).ratio(ratio).block(Block::bordered().title_bottom(Span::styled(format!("{}", TimeRange { start: *pos, end: trimmed.end }), Style::new().bold()))).render(center, frame.buffer_mut()); }
+                                if let Ok(ratio) = trim_right.ratio(*pos).map(f64::from) { gauge(tailwind::GRAY.c700).ratio(ratio).block(Block::bordered()).render(right, frame.buffer_mut()); }
+                                Ok(())
+                            },).map_err(std::io::Error::other)
+                    };
                     match event {
                         Event::Crossterm(event) => match event {
                             crossterm::event::Event::Key(KeyEvent { code, .. }) => match code {
@@ -446,7 +460,9 @@ fn main() -> Result<()> {
                                     let output = output_path.clone();
                                     let range = ninve.trimmed;
                                     ninve.trim_status = Some(format!("trimming {}...", output.display()));
+                                    ninve.trimmed = ninve.full;
                                     info!(?output, "range: {}", range);
+                                    terminal.try_draw(|frame| draw(frame, &ninve, &help_text, &media_path)).context("drawing to screen")?;
                                     tokio::task::spawn_blocking(move || trim_video_with_ffmpeg(&input, &output, range))
                                         .await
                                         .context("trim task panicked")?
@@ -493,94 +509,7 @@ fn main() -> Result<()> {
                             anyhow::bail!("mpv closed");
                         }
                     }
-                    terminal
-                        .try_draw(|frame| {
-                            ninve
-                                .pipe_ref(
-                                    |Ninve {
-                                         loop_mode,
-                                         event_log: _,
-                                         full,
-                                         trimmed,
-                                         pos,
-                                         trim_status: _,
-                                     }|
-                                     -> Result<()> {
-                                        let app = frame.area();
-                                        // app
-                                        {
-                                            let [controls, progress_bar] = Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(app);
-                                            {
-                                                // controls
-                                                help_text
-                                                    .pipe(Paragraph::new)
-                                                    .block(Block::bordered().title_top(format!("{CRATE_NAME} v{CRATE_VERSION} ({})", media_path.display())))
-                                                    .render(controls, frame.buffer_mut());
-                                            }
-                                            // progress bar
-                                            {
-                                                let (trim_left, active, trim_right) = full.to_subrange(*trimmed).expect("bad subrange");
-                                                let [left, center, right] = Layout::horizontal([
-                                                    //
-                                                    full.ratio(trim_left.length()).map(Constraint::from)?,
-                                                    full.ratio(active.length()).map(Constraint::from)?,
-                                                    full.ratio(trim_right.length()).map(Constraint::from)?,
-                                                    //
-                                                ])
-                                                .areas(progress_bar);
-                                                {
-                                                    // gauges
-                                                    let gauge = |color: Color| Gauge::default().style(color);
-                                                    if let Ok(ratio) = trim_left.ratio(*pos).map(f64::from) {
-                                                        gauge(tailwind::GRAY.c700)
-                                                            .ratio(ratio)
-                                                            .block(Block::bordered())
-                                                            .render(left, frame.buffer_mut());
-                                                    }
-
-                                                    if let Ok(ratio) = active.ratio(*pos).map(f64::from) {
-                                                        gauge(match loop_mode {
-                                                            true => tailwind::GREEN.c100,
-                                                            false => tailwind::GRAY.c100,
-                                                        })
-                                                        .ratio(ratio)
-                                                        .block(Block::bordered().title_bottom(Span::styled(
-                                                            format!("{}", TimeRange { start: *pos, end: trimmed.end }),
-                                                            Style::new().bold(),
-                                                        )))
-                                                        .render(center, frame.buffer_mut());
-                                                    }
-
-                                                    if let Ok(ratio) = trim_right.ratio(*pos).map(f64::from) {
-                                                        gauge(tailwind::GRAY.c700)
-                                                            .ratio(ratio)
-                                                            .block(Block::bordered())
-                                                            .render(right, frame.buffer_mut());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Ok(())
-                                        // // logger
-                                        // {
-                                        //     TuiLoggerWidget::default()
-                                        //         .style_error(Style::default().fg(Color::Red))
-                                        //         .style_debug(Style::default().fg(Color::Green))
-                                        //         .style_warn(Style::default().fg(Color::Yellow))
-                                        //         .style_trace(Style::default().fg(Color::Magenta))
-                                        //         .style_info(Style::default().fg(Color::Cyan))
-                                        //         .output_separator(':')
-                                        //         .output_timestamp(Some("%H:%M:%S".to_string()))
-                                        //         .output_level(Some(TuiLoggerLevelOutput::Abbreviated))
-                                        //         .state(&tui_logger_state)
-                                        //         .block(Block::default().title("Logs").borders(Borders::ALL))
-                                        //         .render(logger, frame.buffer_mut());
-                                        // }
-                                    },
-                                )
-                                .map_err(std::io::Error::other)
-                        })
-                        .context("drawing to screen")?;
+                    terminal.try_draw(|frame| draw(frame, &ninve, &help_text, &media_path)).context("drawing to screen")?;
                 }
                 anyhow::bail!("channel closed");
             })
