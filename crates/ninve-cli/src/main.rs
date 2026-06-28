@@ -109,6 +109,7 @@ struct Ninve {
     pos: Time,
     loop_mode: bool,
     event_log: BTreeMap<MpvEventKind, MpvEvent>,
+    trim_status: Option<String>,
 }
 
 impl Ninve {}
@@ -312,9 +313,9 @@ fn trim_video_with_ffmpeg(input: &Path, output: &Path, range: TimeRange) -> Resu
         .args(["-avoid_negative_ts", "make_zero"]) // Fix timestamp issues
         .arg("-y") // Overwrite output file
         .arg(output)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .stdin(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
         .status()
         .context("command did not finish")
         .and_then(|status| if status.success() { Ok(()) } else { Err(anyhow::anyhow!("{status:?}")) })
@@ -358,6 +359,7 @@ fn main() -> Result<()> {
                     pos: Time(0.),
                     loop_mode: false,
                     event_log: Default::default(),
+                    trim_status: None,
                 };
                 commands
                     .command(ObservePropertyCommand::new(ObserveProperty(TimePosKind)))
@@ -394,7 +396,7 @@ fn main() -> Result<()> {
                             generate_filename(&media_path, ninve.trimmed.start, ninve.trimmed.end).with_context(|| format!("running because: {reason:?}"))
                         })
                         .context("evaluating output path")?;
-                    let help_text = [
+                    let mut help_text = [
                         "QUIT:           <c> / <q>",
                         "TRIM LEFT:      <[>",
                         "TRIM RIGHT:     <]>",
@@ -407,6 +409,10 @@ fn main() -> Result<()> {
                         format!("file will be rendered to: {}", output_path.display()).as_str(),
                     ]
                     .join("\n");
+                    if let Some(status) = &ninve.trim_status {
+                        help_text.push('\n');
+                        help_text.push_str(status);
+                    }
                     match event {
                         Event::Crossterm(event) => match event {
                             crossterm::event::Event::Key(KeyEvent { code, .. }) => match code {
@@ -421,9 +427,11 @@ fn main() -> Result<()> {
                                         .context("toggling pause")?;
                                 }
                                 crossterm::event::KeyCode::Char('[') => {
+                                    ninve.trim_status = None;
                                     ninve.trimmed.start = ninve.pos.min(ninve.trimmed.end);
                                 }
                                 crossterm::event::KeyCode::Char(']') => {
+                                    ninve.trim_status = None;
                                     ninve.trimmed.end = ninve.pos.max(ninve.trimmed.start);
                                 }
                                 crossterm::event::KeyCode::Char(c @ 'q' | c @ 'c') => {
@@ -434,7 +442,16 @@ fn main() -> Result<()> {
                                     ninve.loop_mode = !ninve.loop_mode;
                                 }
                                 crossterm::event::KeyCode::Char('r') => {
-                                    return Ok((media_path.clone(), output_path.clone(), ninve.trimmed));
+                                    let input = media_path.clone();
+                                    let output = output_path.clone();
+                                    let range = ninve.trimmed;
+                                    ninve.trim_status = Some(format!("trimming {}...", output.display()));
+                                    info!(?output, "range: {}", range);
+                                    tokio::task::spawn_blocking(move || trim_video_with_ffmpeg(&input, &output, range))
+                                        .await
+                                        .context("trim task panicked")?
+                                        .context("ffmpeg trim failed")?;
+                                    ninve.trim_status = Some("trim complete — press [ / ] to adjust, or r to re-trim".into());
                                 }
                                 key_event => {
                                     info!("[CROSSTERM] {key_event:?}");
@@ -486,6 +503,7 @@ fn main() -> Result<()> {
                                          full,
                                          trimmed,
                                          pos,
+                                         trim_status: _,
                                      }|
                                      -> Result<()> {
                                         let app = frame.area();
